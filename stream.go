@@ -30,6 +30,7 @@ type streamWatcher struct {
 	decoder *json.Decoder
 	sync.Mutex
 	stopped bool
+	done    chan struct{}
 }
 
 // NewStreamWatcher creates a StreamWatcher from the given io.ReadClosers.
@@ -38,6 +39,7 @@ func newStreamWatcher(r io.ReadCloser) watchInterface {
 		r:       r,
 		decoder: json.NewDecoder(r),
 		result:  make(chan Event),
+		done:    make(chan struct{}),
 	}
 	go sw.receive()
 	return sw
@@ -54,6 +56,7 @@ func (sw *streamWatcher) Stop() {
 	defer sw.Unlock()
 	if !sw.stopped {
 		sw.stopped = true
+		close(sw.done)
 		sw.r.Close()
 	}
 }
@@ -88,7 +91,11 @@ func (sw *streamWatcher) receive() {
 			}
 			return
 		}
-		sw.result <- obj
+		select {
+		case sw.result <- obj:
+		case <-sw.done:
+			return
+		}
 	}
 }
 

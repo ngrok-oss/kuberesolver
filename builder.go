@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -205,6 +206,8 @@ type kResolver struct {
 	addresses prometheus.Gauge
 	// lastUpdateUnix is the timestamp of the last successful update to the resolver client
 	lastUpdateUnix prometheus.Gauge
+
+	endpointSlices map[string]EndpointSlice
 }
 
 // ResolveNow will be called by gRPC to try to resolve the target name again.
@@ -220,6 +223,10 @@ func (k *kResolver) Close() {
 }
 
 func (k *kResolver) makeAddresses(e EndpointSlice) ([]resolver.Address, string) {
+	// Placeholder slices for services without pods can have no ports.
+	if len(e.Endpoints) == 0 {
+		return nil, ""
+	}
 	port := k.target.port
 	for _, p := range e.Ports {
 		if k.target.useFirstPort {
@@ -254,44 +261,68 @@ func (k *kResolver) makeAddresses(e EndpointSlice) ([]resolver.Address, string) 
 }
 
 func (k *kResolver) handle(e EndpointSlice) {
-	addrs, _ := k.makeAddresses(e)
-	if len(addrs) > 0 {
-		k.cc.UpdateState(resolver.State{
-			Addresses: addrs,
-		})
-		k.lastUpdateUnix.Set(float64(time.Now().Unix()))
+	if k.endpointSlices == nil {
+		k.endpointSlices = make(map[string]EndpointSlice)
 	}
+	k.endpointSlices[e.Metadata.Name] = e
+	k.publish()
+}
 
-	k.endpoints.Set(float64(len(e.Endpoints)))
+func (k *kResolver) publish() {
+	addrs := make([]resolver.Address, 0)
+	seen := make(map[string]bool)
+	endpointCount := 0
+	for _, slice := range k.endpointSlices {
+		endpointCount += len(slice.Endpoints)
+		sliceAddrs, _ := k.makeAddresses(slice)
+		for _, addr := range sliceAddrs {
+			if !seen[addr.Addr] {
+				seen[addr.Addr] = true
+				addrs = append(addrs, addr)
+			}
+		}
+	}
+	sort.Slice(addrs, func(i, j int) bool { return addrs[i].Addr < addrs[j].Addr })
+	// An empty snapshot must remove the previous destinations from gRPC.
+	k.cc.UpdateState(resolver.State{Addresses: addrs})
+	k.lastUpdateUnix.Set(float64(time.Now().Unix()))
+	k.endpoints.Set(float64(endpointCount))
 	k.addresses.Set(float64(len(addrs)))
 }
 
-func (k *kResolver) resolve() {
-	list, err := getEndpointSliceList(k.k8sClient, k.target.serviceNamespace, k.target.serviceName)
-	if err == nil {
-		for _, e := range list.Items {
-			k.handle(e)
-		}
-	} else {
-		grpclog.Errorf("kuberesolver: lookup endpoints failed: %v", err)
+func (k *kResolver) resolve() (string, error) {
+	list, err := getEndpointSliceList(k.ctx, k.k8sClient, k.target.serviceNamespace, k.target.serviceName)
+	if err != nil {
+		return "", err
 	}
-	// Next lookup should happen after an interval defined by k.freq.
+	// A complete list also removes slices that disappeared during a watch outage.
+	k.endpointSlices = make(map[string]EndpointSlice, len(list.Items))
+	for _, e := range list.Items {
+		k.endpointSlices[e.Metadata.Name] = e
+	}
+	k.publish()
 	k.t.Reset(k.freq)
+	return list.Metadata.ResourceVersion, nil
 }
 
 func (k *kResolver) watch() error {
 	defer k.wg.Done()
-	// watch endpoints lists existing endpoints at start
-	sw, err := watchEndpointSlice(k.ctx, k.k8sClient, k.target.serviceNamespace, k.target.serviceName)
+	version, err := k.resolve()
 	if err != nil {
 		return err
 	}
+	sw, err := watchEndpointSlice(k.ctx, k.k8sClient, k.target.serviceNamespace, k.target.serviceName, version)
+	if err != nil {
+		return err
+	}
+	defer sw.Stop()
 	for {
 		select {
 		case <-k.ctx.Done():
 			return nil
 		case <-k.t.C:
-			k.resolve()
+			// Restart from a new snapshot so queued events cannot undo a newer list.
+			return nil
 		case up, hasMore := <-sw.ResultChan():
 			if hasMore {
 				k.handle(up.Object)
