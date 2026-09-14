@@ -66,3 +66,21 @@ You need give `GET` and `WATCH` access to the `endpointslices` if you are using 
 ### Using With TLS
 
 You need to a certificate with name `service-name.namespace` in order to connect with TLS to your services.
+
+### EndpointSlice aggregation
+
+Each resolver caches all EndpointSlices for its service. Watch updates replace or
+remove one slice. A successful LIST replaces the complete cache. The resolver
+aggregates endpoints across slices and deduplicates them by IP and port before
+it publishes addresses to gRPC. An empty result removes all previous addresses.
+
+The cache follows [kube-proxy's EndpointSliceCache](https://github.com/kubernetes/kubernetes/blob/fc112d4cef32938d9ee6070ce9c954856999e8f5/pkg/proxy/endpointslicecache.go).
+It prefers non-terminating endpoints when duplicate addresses have different
+conditions. It treats an omitted ready condition as ready. Readiness filtering
+occurs after deduplication. Like kube-proxy, it cannot determine which slice has
+the newer conditions during a move between slices.
+
+Each resolver watches one service and applies updates immediately in one
+goroutine. The cache therefore omits kube-proxy's service index, pending updates,
+locks, and topology policy. The resolver retains its LIST/WATCH lifecycle and
+restarts from a complete snapshot after watch failures.

@@ -62,25 +62,25 @@ func requireAddresses(t *testing.T, state resolver.State, want ...string) {
 
 func TestResolverCombinesSlicesAndReplacesUpdates(t *testing.T) {
 	r, c := newRecordingResolver(t)
-	r.handle(testSlice("one", "192.0.2.2", "192.0.2.1"))
-	r.handle(testSlice("two", "192.0.2.3", "192.0.2.1"))
+	r.handle(testSlice("one", "192.0.2.2", "192.0.2.1"), false)
+	r.handle(testSlice("two", "192.0.2.3", "192.0.2.1"), false)
 	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.1:8443", "192.0.2.2:8443", "192.0.2.3:8443")
 	require.Equal(t, float64(4), testutil.ToFloat64(r.endpoints))
 	require.Equal(t, float64(3), testutil.ToFloat64(r.addresses))
 
-	r.handle(testSlice("one", "192.0.2.4"))
+	r.handle(testSlice("one", "192.0.2.4"), false)
 	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.1:8443", "192.0.2.3:8443", "192.0.2.4:8443")
-	r.handle(testSlice("two"))
+	r.handle(testSlice("two"), false)
 	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.4:8443")
 }
 
 func TestResolverPublishesEmptyWhenAllEndpointsBecomeUnready(t *testing.T) {
 	r, c := newRecordingResolver(t)
 	slice := testSlice("one", "192.0.2.1")
-	r.handle(slice)
+	r.handle(slice, false)
 	notReady := false
 	slice.Endpoints[0].Conditions.Ready = &notReady
-	r.handle(slice)
+	r.handle(slice, false)
 	require.Len(t, c.states, 2)
 	require.Empty(t, c.states[1].Addresses)
 	require.Zero(t, testutil.ToFloat64(r.addresses))
@@ -93,8 +93,8 @@ func TestResolverPublishesEmptySliceWithoutPorts(t *testing.T) {
 	r.target.useFirstPort = true
 	slice := testSlice("one", "192.0.2.1")
 	slice.Ports = []EndpointPort{{Port: 8443}}
-	r.handle(slice)
-	r.handle(testSlice("one"))
+	r.handle(slice, false)
+	r.handle(testSlice("one"), false)
 	require.Len(t, c.states, 2)
 	require.Empty(t, c.states[1].Addresses)
 }
@@ -115,7 +115,7 @@ func TestResolverListReplacesSnapshotAndPublishesEmpty(t *testing.T) {
 			defer api.Close()
 			r, c := newRecordingResolver(t)
 			r.k8sClient = NewInsecureK8sClient(api.URL)
-			r.handle(testSlice("old", "192.0.2.99"))
+			r.handle(testSlice("old", "192.0.2.99"), false)
 			c.states = nil
 			r.resolve()
 			require.Len(t, c.states, 1)
@@ -131,10 +131,10 @@ func TestResolverKeepsSnapshotWhenListFails(t *testing.T) {
 	defer api.Close()
 	r, c := newRecordingResolver(t)
 	r.k8sClient = NewInsecureK8sClient(api.URL)
-	r.handle(testSlice("one", "192.0.2.1"))
+	r.handle(testSlice("one", "192.0.2.1"), false)
 	r.resolve()
 	require.Len(t, c.states, 1)
-	r.handle(testSlice("two", "192.0.2.2"))
+	r.handle(testSlice("two", "192.0.2.2"), false)
 	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.1:8443", "192.0.2.2:8443")
 }
 
@@ -161,61 +161,73 @@ func receive[T any](t *testing.T, values <-chan T) T {
 }
 
 func TestResolverWatchUsesSnapshotVersionAndRefreshesCache(t *testing.T) {
-	lists := make(chan EndpointSliceList, 3)
-	lists <- EndpointSliceList{Metadata: Metadata{ResourceVersion: "10"}, Items: []EndpointSlice{testSlice("one", "192.0.2.1"), testSlice("two", "192.0.2.2")}}
-	lists <- EndpointSliceList{Metadata: Metadata{ResourceVersion: "20"}, Items: []EndpointSlice{testSlice("three", "192.0.2.3")}}
-	lists <- EndpointSliceList{Metadata: Metadata{ResourceVersion: "30"}}
-	versions := make(chan string, 3)
-	events := make(chan *Event)
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Query().Get("labelSelector") != "kubernetes.io/service-name=app" {
-			http.Error(w, "missing service selector", http.StatusBadRequest)
-			return
+	for _, endEvent := range []*Event{nil, {Type: Error}} {
+		name := "EOF"
+		if endEvent != nil {
+			name = "ERROR"
 		}
-		switch req.URL.Path {
-		case "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices":
-			select {
-			case list := <-lists:
-				_ = json.NewEncoder(w).Encode(list)
-			case <-req.Context().Done():
-			}
-		case "/apis/discovery.k8s.io/v1/watch/namespaces/default/endpointslices":
-			versions <- req.URL.Query().Get("resourceVersion")
-			w.WriteHeader(http.StatusOK)
-			w.(http.Flusher).Flush()
-			for {
-				select {
-				case event := <-events:
-					if event == nil {
-						return
-					}
-					_ = json.NewEncoder(w).Encode(event)
-					w.(http.Flusher).Flush()
-				case <-req.Context().Done():
+		t.Run(name, func(t *testing.T) {
+			lists := make(chan EndpointSliceList, 3)
+			lists <- EndpointSliceList{Metadata: Metadata{ResourceVersion: "10"}, Items: []EndpointSlice{testSlice("one", "192.0.2.1"), testSlice("two", "192.0.2.2")}}
+			lists <- EndpointSliceList{Metadata: Metadata{ResourceVersion: "20"}, Items: []EndpointSlice{testSlice("three", "192.0.2.3")}}
+			lists <- EndpointSliceList{Metadata: Metadata{ResourceVersion: "30"}}
+			versions := make(chan string, 3)
+			events := make(chan *Event)
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.URL.Query().Get("labelSelector") != "kubernetes.io/service-name=app" {
+					http.Error(w, "missing service selector", http.StatusBadRequest)
 					return
 				}
-			}
-		default:
-			http.NotFound(w, req)
-		}
-	}))
-	t.Cleanup(api.Close)
-	c := &watchingConn{states: make(chan resolver.State, 16)}
-	b := NewBuilder(NewInsecureK8sClient(api.URL), kubernetesSchema)
-	r, err := b.Build(parseTarget("kubernetes:///app.default:8443"), c, resolver.BuildOptions{})
-	require.NoError(t, err)
-	t.Cleanup(r.Close)
-	requireAddresses(t, receive(t, c.states), "192.0.2.1:8443", "192.0.2.2:8443")
-	require.Equal(t, "10", receive(t, versions))
-	events <- &Event{Type: Modified, Object: testSlice("one")}
-	requireAddresses(t, receive(t, c.states), "192.0.2.2:8443")
-	events <- nil
-	requireAddresses(t, receive(t, c.states), "192.0.2.3:8443")
-	require.Equal(t, "20", receive(t, versions))
+				switch req.URL.Path {
+				case "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices":
+					select {
+					case list := <-lists:
+						_ = json.NewEncoder(w).Encode(list)
+					case <-req.Context().Done():
+					}
+				case "/apis/discovery.k8s.io/v1/watch/namespaces/default/endpointslices":
+					versions <- req.URL.Query().Get("resourceVersion")
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+					for {
+						select {
+						case event := <-events:
+							if event == nil {
+								return
+							}
+							_ = json.NewEncoder(w).Encode(event)
+							w.(http.Flusher).Flush()
+						case <-req.Context().Done():
+							return
+						}
+					}
+				default:
+					http.NotFound(w, req)
+				}
+			}))
+			t.Cleanup(api.Close)
+			c := &watchingConn{states: make(chan resolver.State, 16)}
+			b := NewBuilder(NewInsecureK8sClient(api.URL), kubernetesSchema)
+			r, err := b.Build(parseTarget("kubernetes:///app.default:8443"), c, resolver.BuildOptions{})
+			require.NoError(t, err)
+			t.Cleanup(r.Close)
+			requireAddresses(t, receive(t, c.states), "192.0.2.1:8443", "192.0.2.2:8443")
+			require.Equal(t, "10", receive(t, versions))
+			events <- &Event{Type: Modified, Object: testSlice("one")}
+			requireAddresses(t, receive(t, c.states), "192.0.2.2:8443")
+			events <- &Event{Type: Deleted, Object: testSlice("two", "192.0.2.2")}
+			require.Empty(t, receive(t, c.states).Addresses)
+			events <- &Event{Type: Added, Object: testSlice("two", "192.0.2.4")}
+			requireAddresses(t, receive(t, c.states), "192.0.2.4:8443")
+			events <- endEvent
+			requireAddresses(t, receive(t, c.states), "192.0.2.3:8443")
+			require.Equal(t, "20", receive(t, versions))
 
-	r.(*kResolver).t.Reset(0)
-	require.Empty(t, receive(t, c.states).Addresses)
-	require.Equal(t, "30", receive(t, versions))
+			r.(*kResolver).t.Reset(0)
+			require.Empty(t, receive(t, c.states).Addresses)
+			require.Equal(t, "30", receive(t, versions))
+		})
+	}
 }
 
 func TestResolverCloseCancelsInitialList(t *testing.T) {
@@ -240,4 +252,84 @@ func TestResolverCloseCancelsInitialList(t *testing.T) {
 	}()
 	receive(t, closed)
 	receive(t, canceled)
+}
+
+func TestResolverSliceMoveAndDeletion(t *testing.T) {
+	r, c := newRecordingResolver(t)
+	r.handle(testSlice("one", "192.0.2.1", "192.0.2.2"), false)
+	r.handle(testSlice("two", "192.0.2.2"), false)
+	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.1:8443", "192.0.2.2:8443")
+
+	// Removing the source slice must preserve the endpoint in the destination slice.
+	r.handle(testSlice("one", "192.0.2.1", "192.0.2.2"), true)
+	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.2:8443")
+	require.Equal(t, float64(1), testutil.ToFloat64(r.endpoints))
+	r.handle(testSlice("missing", "192.0.2.99"), true)
+	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.2:8443")
+	r.handle(testSlice("two", "192.0.2.2"), true)
+	require.Empty(t, c.states[len(c.states)-1].Addresses)
+	require.Zero(t, testutil.ToFloat64(r.endpoints))
+}
+
+func TestResolverEndpointConditions(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		conditions EndpointConditions
+		want       []string
+	}{
+		{"unknown readiness", EndpointConditions{}, []string{"192.0.2.1:8443"}},
+		{"unready", EndpointConditions{Ready: boolPointer(false)}, []string{}},
+		{"ready terminating", EndpointConditions{Ready: boolPointer(true), Terminating: boolPointer(true)}, []string{"192.0.2.1:8443"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r, c := newRecordingResolver(t)
+			slice := testSlice("one", "192.0.2.1")
+			slice.Endpoints[0].Conditions = test.conditions
+			r.handle(slice, false)
+			requireAddresses(t, c.states[0], test.want...)
+		})
+	}
+}
+
+func boolPointer(value bool) *bool { return &value }
+
+func TestEndpointSliceCachePrefersNonTerminatingDuplicate(t *testing.T) {
+	for _, ready := range []bool{false, true} {
+		for _, reverse := range []bool{false, true} {
+			running := Endpoint{Addresses: []string{"192.0.2.1"}, Conditions: EndpointConditions{Ready: &ready}}
+			terminating := Endpoint{Addresses: []string{"192.0.2.1"}, Conditions: EndpointConditions{Ready: boolPointer(!ready), Terminating: boolPointer(true)}}
+			endpoints := []Endpoint{running, terminating}
+			if reverse {
+				endpoints[0], endpoints[1] = endpoints[1], endpoints[0]
+			}
+			set := make(map[string]endpointInfo)
+			for _, endpoint := range endpoints {
+				addEndpoints(set, []Endpoint{endpoint}, "8443")
+			}
+			require.Equal(t, map[string]endpointInfo{"192.0.2.1:8443": {ready: ready}}, set)
+		}
+	}
+}
+
+func TestResolverResolvesPortsPerSlice(t *testing.T) {
+	r, c := newRecordingResolver(t)
+	r.target.port = "grpc"
+	r.target.resolveByPortName = true
+	one := testSlice("one", "192.0.2.1")
+	one.Ports = []EndpointPort{{Name: "grpc", Port: 8443}}
+	two := testSlice("two", "192.0.2.1")
+	two.Ports = []EndpointPort{{Name: "grpc", Port: 9443}}
+	r.handle(one, false)
+	r.handle(two, false)
+	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.1:8443", "192.0.2.1:9443")
+	two.Ports = []EndpointPort{{Name: "other", Port: 9443}}
+	r.handle(two, false)
+	requireAddresses(t, c.states[len(c.states)-1], "192.0.2.1:8443")
+}
+
+func TestResolverDeduplicatesIPv6Addresses(t *testing.T) {
+	r, c := newRecordingResolver(t)
+	r.handle(testSlice("one", "2001:db8::1"), false)
+	r.handle(testSlice("two", "2001:db8:0:0:0:0:0:1"), false)
+	requireAddresses(t, c.states[len(c.states)-1], "[2001:db8::1]:8443")
 }
